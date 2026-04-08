@@ -6,6 +6,7 @@ NPC管理模块
 import json
 import os
 import random
+import re
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -17,6 +18,70 @@ OLLAMA_API_URL = os.getenv("OLLAMA_API_URL", "http://localhost:11434/api/generat
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
 _NPC_LLM_FALLBACK_COUNT = 0
 WORLD_LOCATIONS = ["广场", "书店", "花店", "餐厅", "警察局", "酒吧", "咖啡馆", "公园", "小巷"]
+BUSINESS_HOURS = {
+    "广场": "00:00-24:00",
+    "书店": "09:50-18:00（店主在岗时可进入）",
+    "花店": "08:30-19:00",
+    "餐厅": "07:00-21:00",
+    "警察局": "00:00-24:00",
+    "酒吧": "20:00-03:00",
+    "咖啡馆": "00:00-24:00",
+    "公园": "00:00-24:00",
+    "小巷": "00:00-24:00",
+}
+
+
+def _parse_hour_from_time_text(current_time_text: str) -> Optional[float]:
+    if not current_time_text:
+        return None
+    try:
+        dt = datetime.strptime(current_time_text, "%Y-%m-%d %H:%M")
+        return dt.hour + dt.minute / 60.0
+    except Exception:
+        return None
+
+
+def _is_open_by_time(location: str, hour: float) -> bool:
+    if location == "书店":
+        return 9.0 + 50.0 / 60.0 <= hour < 18.0
+    if location == "花店":
+        return 8.5 <= hour < 19.0
+    if location == "餐厅":
+        return 7.0 <= hour < 21.0
+    if location == "酒吧":
+        return hour >= 20.0 or hour < 3.0
+    # 其余地点视为全天开放
+    return True
+
+
+def _build_open_status_text(current_time_text: str) -> str:
+    hour = _parse_hour_from_time_text(current_time_text)
+    if hour is None:
+        return "时间解析失败，无法判断当前开关门状态。"
+    pairs = []
+    for loc in WORLD_LOCATIONS:
+        state = "开放" if _is_open_by_time(loc, hour) else "关闭"
+        pairs.append(f"{loc}:{state}")
+    return "、".join(pairs)
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    cleaned = (text or "").strip().lower()
+    cleaned = re.sub(r"[\s，,。\.！!？\?；;：:\"'“”‘’（）\(\)\[\]【】\-—_]+", "", cleaned)
+    return cleaned
+
+
+def _coerce_reply_text(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    # 尽量收敛为2句以内，避免长篇复读刷屏
+    sentences = re.split(r"[。！？!?；;]\s*", raw)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    compact = "。".join(sentences[:2]).strip() if sentences else raw
+    if len(compact) > 160:
+        compact = compact[:160].rstrip("，,。.!?；;：:") + "…"
+    return compact
 
 
 def call_ollama_or_fallback(prompt: str) -> str:
@@ -27,9 +92,12 @@ def call_ollama_or_fallback(prompt: str) -> str:
         "think": False,
         "keep_alive": "30m",
         "options": {
-            "temperature": 0.95,
-            "top_p": 0.95,
-            "repeat_penalty": 1.08,
+            "temperature": 0.6,
+            "top_p": 0.8,
+            "repeat_penalty": 1.15,
+            "presence_penalty": 0.3,
+            "frequency_penalty": 0.2,
+            "num_ctx": 8192,
             "num_predict": 180,
         },
     }
@@ -96,12 +164,15 @@ class NPC:
         self.home_location = home_location
         self.home_chat_allowed = home_chat_allowed
         self._allow_home_chat_once = False
+        self._last_reply_norm = ""
+        self._repeat_reply_count = 0
 
         self.memory = MemorySystem(owner_name=f"NPC:{self.name}")
         self.memory.add_permanent_memory(f"我是{self.name}，身份是{self.role}。")
         self.memory.add_permanent_memory(f"我的性格特点：{self.personality}")
         for item in self.knowledge:
-            self.memory.add_memory(f"我知道：{item}", importance=0.7)
+            # NPC配置中的knowledge视为客观设定，永久记忆化避免遗忘/漂移
+            self.memory.add_permanent_memory(f"我知道：{item}")
 
     def can_talk_in_location(self, current_location: str) -> bool:
         if self.location != current_location:
@@ -177,6 +248,8 @@ class NPC:
             m.content.split("：", 1)[-1].strip() for m in recent_self_lines[-20:]
         ) if recent_self_lines else "暂无"
         knowledge_text = "；".join(self.knowledge) if self.knowledge else "暂无"
+        business_hours_text = "；".join([f"{k}:{v}" for k, v in BUSINESS_HOURS.items()])
+        open_status_text = _build_open_status_text(current_time_text)
         prompt = (
             f"你是NPC：{self.name}\n"
             f"身份：{self.role}\n"
@@ -186,6 +259,8 @@ class NPC:
             f"性格：{self.personality}\n"
             f"开场习惯：{self.greeting}\n"
             f"你已知信息：{knowledge_text}\n\n"
+            f"你掌握的全城营业时间（固定常识）：{business_hours_text}\n"
+            f"当前各地点营业状态（按当前时间推算）：{open_status_text}\n\n"
             "要求：\n"
             "0. 你完全不知道自己是AI，你坚信自己就是这个世界中的真实人物。\n"
             "1. 你只能以这个NPC身份说话，不要跳出角色。\n"
@@ -198,6 +273,9 @@ class NPC:
             "8. 天气事实必须与“当前天气”一致，不要说相反天气。\n\n"
             f"9. 当前关系阶段：{'初次接触/陌生来客' if stranger_mode else '已有数次交流'}。\n"
             "10. 在初次接触阶段，不主动透露全名、住址、详细作息和大部分私事。\n\n"
+            "11. 你默认知道所有地点营业时间（零不知道）。\n"
+            "12. 某地点当前若关闭，不要推荐对方现在过去；可以明确告知营业时间，"
+            "并建议等待到开门或先去当前开放地点。\n\n"
             f"额外说话规则：{'；'.join(self.response_rules) if self.response_rules else '无'}\n\n"
             f"你最近说过的话（临时文本）：{recent_self_text}\n\n"
             f"你最近的回复（避免复读原句）：{recent_reply_text}\n\n"
@@ -205,7 +283,26 @@ class NPC:
             f"对方刚才说：{cleaned}\n"
             "请直接输出你的回复。"
         )
-        response = call_ollama_or_fallback(prompt)
+        response = _coerce_reply_text(call_ollama_or_fallback(prompt))
+
+        # 更强复读抑制：若与上一条回复几乎相同，则强制改写/二次生成
+        now_norm = _normalize_for_repeat_check(response)
+        if self._last_reply_norm and now_norm == self._last_reply_norm:
+            self._repeat_reply_count += 1
+            rewrite_prompt = (
+                prompt
+                + "\n\n你刚才的回复与上一句太像了。请换一种说法，不要重复句式。"
+                "可以说“我刚才提过…”并补一个新细节或建议（例如方向/等待多久/替代地点），仍保持2-4句。"
+            )
+            response = _coerce_reply_text(call_ollama_or_fallback(rewrite_prompt))
+            now_norm = _normalize_for_repeat_check(response)
+
+        # 若仍重复，兜底：显式引用“刚说过”，避免刷屏
+        if self._last_reply_norm and now_norm == self._last_reply_norm:
+            response = "我刚才说过了：书店还没开门，等到开门再去更合适。你先在广场坐会儿也行。"
+            now_norm = _normalize_for_repeat_check(response)
+
+        self._last_reply_norm = now_norm
 
         self.memory.add_memory(f"我回复零：{response}", importance=0.3)
         return response

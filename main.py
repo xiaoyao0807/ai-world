@@ -35,6 +35,8 @@ _LAST_INFO_SOURCE = ""
 _LAST_DECISION_THOUGHT = ""
 _LAST_SPOKEN_LINE = ""
 _MOVE_HISTORY: list = []
+_LAST_ACTION = ""
+_CONSECUTIVE_MOVE_COUNT = 0
 PROTAGONIST_PROFILE = (
     "你完全不知道自己是一个AI智能体，你坚信自己是真实的人类。"
     "你是一个有好奇心、有情感、会思考的普通人。"
@@ -99,9 +101,12 @@ def call_ollama_or_fallback(prompt: str) -> str:
         "think": False,
         "keep_alive": "30m",
         "options": {
-            "temperature": 0.95,
-            "top_p": 0.95,
-            "repeat_penalty": 1.08,
+            "temperature": 0.6,
+            "top_p": 0.8,
+            "repeat_penalty": 1.15,
+            "presence_penalty": 0.3,
+            "frequency_penalty": 0.2,
+            "num_ctx": 8192,
             "num_predict": 180,
         },
     }
@@ -174,6 +179,29 @@ def extract_location_mentions(text: str, locations: Set[str]) -> Set[str]:
 def split_facts(text: str) -> list:
     parts = re.split(r"[。！？!?；;]\s*", text or "")
     return [p.strip() for p in parts if p.strip()]
+
+
+def _normalize_for_repeat_check(text: str) -> str:
+    cleaned = (text or "").strip().lower()
+    # 去掉常见标点与空白，避免“同一句不同标点”绕过去重
+    cleaned = re.sub(r"[\s，,。\.！!？\?；;：:\"'“”‘’（）\(\)\[\]【】\-—_]+", "", cleaned)
+    return cleaned
+
+
+def _coerce_dialogue_line(text: str) -> str:
+    """
+    把LLM输出尽量收敛为“对人说的一句话”，避免把观察/移动叙述当成对话内容。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    # 取第一段/第一句，避免长段自述
+    first = re.split(r"[\n\r]+", raw, maxsplit=1)[0].strip()
+    first = re.split(r"[。！？!?；;]\s*", first, maxsplit=1)[0].strip()
+    # 过长则再截断
+    if len(first) > 60:
+        first = first[:60].rstrip("，,。.!?；;：:") + "…"
+    return first
 
 
 def should_trigger_identity_query(reply: str, name: str) -> bool:
@@ -284,7 +312,7 @@ def run_autonomous_turn(
     fact_confidence: Dict[str, float],
     identity_shelved: Set[str],
 ) -> Tuple[Optional[str], Optional[str]]:
-    global _LAST_LOCATION_FOR_MOVE, _MOVE_BOUNCE_COUNT, _IDENTITY_QUERY_ATTEMPTS, _BLOCKED_TARGET_ATTEMPTS, _LAST_INFO_SOURCE, _LAST_DECISION_THOUGHT, _LAST_SPOKEN_LINE, _MOVE_HISTORY
+    global _LAST_LOCATION_FOR_MOVE, _MOVE_BOUNCE_COUNT, _IDENTITY_QUERY_ATTEMPTS, _BLOCKED_TARGET_ATTEMPTS, _LAST_INFO_SOURCE, _LAST_DECISION_THOUGHT, _LAST_SPOKEN_LINE, _MOVE_HISTORY, _LAST_ACTION, _CONSECUTIVE_MOVE_COUNT
     decision = decide_next_action(
         world,
         protagonist_memory,
@@ -300,6 +328,26 @@ def run_autonomous_turn(
     print(f"[零的决策] action={action}, target={target or '无'}")
     if _LAST_DECISION_THOUGHT:
         print(f"[零的思考] {_LAST_DECISION_THOUGHT}")
+
+    # 软/硬结合的“连续移动”防抖：不允许连续两回合都移动（除非有明确约定要去某地）
+    if action == "move":
+        if _LAST_ACTION == "move" and not pending_commitment:
+            _CONSECUTIVE_MOVE_COUNT += 1
+        else:
+            _CONSECUTIVE_MOVE_COUNT = 1
+        if _CONSECUTIVE_MOVE_COUNT >= 2 and not pending_commitment:
+            if npcs_here:
+                action = "talk"
+                target = random.choice(npcs_here).name
+                _LAST_DECISION_THOUGHT = "我刚移动过，先和附近的人聊两句再决定下一步。"
+                print(f"[零的决策] 连续移动被拦截，改为talk，target={target}")
+            else:
+                action = "observe"
+                target = ""
+                _LAST_DECISION_THOUGHT = "我刚移动过，先停下来观察一下再说。"
+                print("[零的决策] 连续移动被拦截，改为observe")
+    else:
+        _CONSECUTIVE_MOVE_COUNT = 0
 
     if action == "move":
         allow_bookstore_entry = True
@@ -391,6 +439,7 @@ def run_autonomous_turn(
                 return None, pending_identity_name
         if pending_commitment and target == pending_commitment and "移动到" in result:
             return None, pending_identity_name
+        _LAST_ACTION = "move"
         return pending_commitment, pending_identity_name
 
     if action == "talk":
@@ -451,14 +500,24 @@ def run_autonomous_turn(
             say_text = protagonist_think_and_reply(
                 world,
                 protagonist_memory,
-                f"你准备和{display_name}对话。请避免和前几轮重复，给出一句有新信息价值的话。",
+                f"你准备和{display_name}对话。请只输出一句“对对方说的话”，不要写场景描写/移动/观察/内心独白。"
+                "避免和前几轮重复，尽量提出一个具体问题或一句简短自然的回应（20字以内优先）。",
             )
-        if _LAST_SPOKEN_LINE and say_text.strip() == _LAST_SPOKEN_LINE.strip():
+        say_text = _coerce_dialogue_line(say_text)
+        # 更强的复读检测：忽略空白/标点也算重复
+        last_norm = _normalize_for_repeat_check(_LAST_SPOKEN_LINE) if _LAST_SPOKEN_LINE else ""
+        now_norm = _normalize_for_repeat_check(say_text)
+        if last_norm and now_norm and now_norm == last_norm:
             say_text = protagonist_think_and_reply(
                 world,
                 protagonist_memory,
-                "你刚才说过类似的话，请换一种更自然的新表达，不要重复。",
+                "你刚才说过类似的话了。请只输出一句新的、简短的对话句（不要场景描写），换一个具体问题。",
             )
+            say_text = _coerce_dialogue_line(say_text)
+            now_norm = _normalize_for_repeat_check(say_text)
+        # 若仍然重复，直接改为稳定的短句，避免继续复读刷屏
+        if last_norm and now_norm and now_norm == last_norm:
+            say_text = "方便简单说说这里的情况吗？"
         _LAST_SPOKEN_LINE = say_text
         npc_reply = npc_manager.talk_to_npc(
             target,
@@ -474,6 +533,7 @@ def run_autonomous_turn(
         scene_label = f"{display_name}(在{world.current_location})" if display_name == "陌生人" else display_name
         print(f"[零的行动] 零对{scene_label}：{say_text}")
         print(f"[NPC回应] {scene_label}：{npc_reply}")
+        _LAST_ACTION = "talk"
 
         # 只有“明确询问姓名/身份”时，才允许解锁人名
         asked_identity = any(k in say_text for k in ["你是谁", "叫什么", "名字", "怎么称呼", "你是做什么", "这个人是谁"])
@@ -536,6 +596,7 @@ def run_autonomous_turn(
         protagonist_memory.add_memory(f"我在餐厅点单吃饭：{meal_text}", importance=0.6)
         world.add_event("零在餐厅点了餐并吃饭。")
         print(f"[零的行动] 点单吃饭：{meal_text}")
+        _LAST_ACTION = "eat"
         return pending_commitment, pending_identity_name
 
     if action == "observe":
@@ -548,6 +609,7 @@ def run_autonomous_turn(
         protagonist_memory.add_memory(f"我观察到：{thought}", importance=0.3)
         world.add_event("零停下脚步观察环境。")
         print(f"[零的行动] 观察：{thought}")
+        _LAST_ACTION = "observe"
         # 在广场看到路牌后解锁地点认知
         if world.current_location == "广场":
             known_locations.update(set(world.available_locations))
@@ -557,6 +619,7 @@ def run_autonomous_turn(
     wait_result = world.wait(hours=0.25)
     protagonist_memory.add_memory(f"我选择等待。结果：{wait_result}", importance=0.3)
     print(f"[零的行动] {wait_result}")
+    _LAST_ACTION = "wait"
     return pending_commitment, pending_identity_name
 
 
