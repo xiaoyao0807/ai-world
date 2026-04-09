@@ -39,7 +39,14 @@ class WorldState:
             "广场旁边是步行街，两个区域在地图上连在一起",
             "零的家在广场旁边的一栋居民楼里",
         ]
-        self.location_objects["广场"].extend(["圆形喷泉", "连向步行街的拱形入口"])
+        self.location_objects["广场"].extend(
+            [
+                "正中心有一座圆形喷泉",
+                "喷泉外圈偏远一点的位置有一把大型固定式遮阳伞",
+                "遮阳伞下是连体桌椅，形成一块小型公共休息区",
+                "连向步行街的拱形入口",
+            ]
+        )
         self.location_objects["广场"].append("路牌：书店、花店、餐厅、警察局、酒吧、咖啡馆、公园、小巷")
         self.location_objects["花店"].append("花店玻璃橱窗与二楼小阳台")
         self.location_objects["咖啡馆"].extend(["自助点单机器", "后厨咖啡机器人"])
@@ -164,6 +171,21 @@ class WorldState:
         if location == "咖啡馆":
             return True
         return True
+
+    def get_location_hours_text(self, location: str) -> str:
+        location = self.resolve_location(location)
+        hours_map = {
+            "书店": "09:50-18:00（店主在岗时可进入）",
+            "花店": "08:30-19:00",
+            "餐厅": "07:00-21:00",
+            "酒吧": "20:00-03:00",
+            "警察局": "00:00-24:00",
+            "咖啡馆": "00:00-24:00",
+            "广场": "00:00-24:00",
+            "公园": "00:00-24:00",
+            "小巷": "00:00-24:00",
+        }
+        return hours_map.get(location, "未知")
 
     def add_world_thing(self, thing: str, location: str = "") -> str:
         cleaned_thing = thing.strip()

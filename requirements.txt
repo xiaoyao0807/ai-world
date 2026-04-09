@@ -1,0 +1,5 @@
+# 核心（对话 / Ollama）
+requests>=2.28.0
+
+# RAG：LanceDB 向量记忆（可选；未安装时程序仍运行，WORLD_RAG=0 可显式关闭）
+lancedb>=0.14.0
