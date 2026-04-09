@@ -3,7 +3,7 @@
 # Closed Text World AI (Observer Mode)
 
 一个受《楚门的世界》启发的AI实验项目。AI智能体拥有记忆、遗忘机制和独立NPC系统。
-**你只能观察，不能操控。**  
+**你可以观察他的思想和行为，但是不能操控。**  
 
 主角「零」是一个基于 qwen3.5:4b 的纯血AI，但是他只认为自己是一位会自主思考、行动、对话、学习的人类；其他角色也各自有独立记忆与人格，他们只会根据自己的性格和记忆做出动作和回答，没有固定的回复框架！
 
@@ -24,18 +24,27 @@
 | 🔧 **Ollama fallback** | 本地模型不可用时自动回退，程序不中断 |
 | 🛡️ **Anti-loop behavior** | 包含跨场景对话拦截与“左右横跳”防抖逻辑 |
 
+| 新增特性 | 说明 |
+|---------|------|
+| 🧠 **RAG记忆系统** | 基于LanceDB的向量检索，长期记忆增强 |
+| 📋 **Planner规划** | LLM生成结构化计划，支持失败重规划 |
+| 🎯 **扩展行为** | inspect/reflect/review_plan/rest等新动作 |
+| 🔄 **会话隔离** | 每次运行独立ID，防止历史污染 |
+| 🤖 **自动批处理** | `--auto N` 连续运行，支持暂停 |
 ---
 
 ## Tech Stack
 
 - Python 3.9+
 - `requests`
-- Local Ollama API (`http://localhost:11434`)
+- `lancedb`（可选，用于 RAG）
+- Ollama 本地 API（`http://localhost:11434`）
 
 安装依赖：
 
 ```bash
-pip install requests
+pip install -r requirements.txt
+```
 
 ---
 
@@ -47,7 +56,10 @@ world/
 ├─ memory_system.py
 ├─ world_state.py
 ├─ npc_manager.py
+├─ rag_memory.py
+├─ requirements.txt
 ├─ README.md
+├─ UPDATE_LOG.md
 ├─ RECORDING_GUIDE.md
 ├─ run.bat
 ├─ run.sh
@@ -58,7 +70,6 @@ world/
    ├─ restaurant_owner_jin_dahua.json
    └─ passerby_li_shimin.json
 ```
-
 ---
 
 ## Run
@@ -87,6 +98,7 @@ chmod +x run.sh
 ## Observer Commands
 
 - `继续`：推进 1 个自治回合（空输入也可继续）
+- `自动 [N] [间隔秒]`：连续自动推进（默认 `N=50`，间隔 `0.5s`）
 - `查看记忆`：查看零的记忆摘要
 - `查看状态`：查看当前世界状态
 - `添加事实 <内容>`：添加全局事实
@@ -95,29 +107,73 @@ chmod +x run.sh
 - `退出`
 
 ---
+## Action Set
 
-## Ollama (Optional but Recommended)
+当前可执行动作（由 AI 自主选择）：
 
-推荐模型（平衡效果与速度）：
+- `move`
+- `talk`
+- `wait`
+- `observe`
+- `eat`
+- `inspect`
+- `reflect`
+- `review_plan`
+- `rest`
+- `query_hours`
+- `ask_npc_location`
+- `verify_fact`
 
-- `qwen3.5:4b`
-- `qwen3.5:latest`
+---
 
-启动模型示例：
+## Planner and Replanning
+
+- `plan_state` 维护当前目标与步骤。
+- 每回合根据当前计划与环境决策动作。
+- 当关键行动失败（如目标不在、地点不可达）时：
+  - 记录高重要性失败记忆
+  - 清空旧计划
+  - 立刻触发 Planner 重新生成新计划
+
+---
+
+## RAG Memory (LanceDB + Ollama Embedding)
+
+默认启用（可关闭）：
+
+- 向量库：LanceDB
+- 嵌入：Ollama embedding 模型（默认 `nomic-embed-text`）
+
+先拉取嵌入模型：
 
 ```bash
-ollama run qwen3.5:4b
+ollama pull nomic-embed-text
 ```
 
-可选环境变量：
+### 环境变量
 
 ```bash
-# Windows PowerShell
+# PowerShell
 $env:OLLAMA_API_URL="http://localhost:11434/api/generate"
 $env:OLLAMA_MODEL="qwen3.5:4b"
+$env:OLLAMA_EMBED_MODEL="nomic-embed-text"
+$env:WORLD_RAG="1"
+$env:WORLD_RAG_PATH=".world_data/lance_zero"
 ```
-若 Ollama 未启动，程序会自动使用回退文案继续运行。
----
+
+说明：
+
+- `WORLD_RAG=0` 可关闭 RAG。
+- 程序会优先调用 `/api/embed`，并自动兼容旧 `/api/embeddings`。
+- 若嵌入不可用，会自动停用本局向量同步，避免持续刷错。
+
+### 会话隔离
+
+每次运行会生成独立 `session_id`，RAG 表名形如：
+
+- `zero_memories_<session_id>`
+
+因此新一局不会自动检索上一局的日志/记忆。
 
 ## 🎨 如何为这个世界添加内容
 
